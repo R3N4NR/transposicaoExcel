@@ -1,132 +1,187 @@
 import xlwings as xw
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import ttk, filedialog, messagebox
+import logging
+from threading import Thread
+import os
 
-# Função que será chamada ao selecionar o arquivo
+class TextHandler(logging.Handler):
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.text_widget.configure(state="normal")
+        self.text_widget.insert(tk.END, log_entry + '\n')
+        self.text_widget.configure(state="disabled")
+        self.text_widget.see(tk.END)
+
+
+
+# Define o caminho do arquivo de log na raiz do usuário
+log_file_path = os.path.join(os.path.expanduser("~"), "filtroExcel.log")
+def setup_logger(text_widget):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    # Arquivo de log
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Text handler para o Text widget
+    text_handler = TextHandler(text_widget)
+    text_handler.setFormatter(formatter)
+    logger.addHandler(text_handler)
+
 def processar_arquivo(arquivo):
-    """
-    Abre o arquivo Excel selecionado, aplica fórmulas e processos
-    nas colunas 'S' e 'T' das planilhas, e cria uma tabela dinâmica
-    com os resultados.
-    """
+    logging.info(f"Iniciando o processamento do arquivo: {arquivo}")
+    app = xw.App(visible=False)
     try:
-        # Abre o arquivo Excel com xlwings
-        wb = xw.Book(arquivo)
+        wb = app.books.open(arquivo)
+        app.screen_updating = False
+        app.calculation = 'manual'
+        logging.info("Configurações de atualização e cálculo desativadas.")
 
-        # Itera sobre cada planilha no arquivo
+        sheet_consolidado = None
         for sheet in wb.sheets:
-            # Insere fórmula na coluna 'S' (verifica se a coluna 'A' começa com 'Nota')
-            sheet.range('S2:S100').formula = '=IF(LEFT(A2, 4) = "Nota", B2, "")'
-            # Insere fórmula na coluna 'T' (procura por " - " na coluna 'A' e verifica formato numérico)
-            sheet.range('T2:T100').formula = '=IF(ISERROR(SEARCH(" - ", A1)), "", IF(AND(ISNUMBER(VALUE(LEFT(A1, SEARCH(" - ", A1) - 1))), SEARCH(" - ", A1) > 0), A1, ""))'
+            if sheet.name == 'Filtro':
+                sheet_consolidado = sheet
+                sheet_consolidado.clear()
+                logging.info("Planilha 'Filtro' encontrada e limpa.")
+                break
+        if not sheet_consolidado:
+            sheet_consolidado = wb.sheets.add(name='Filtro')
+            logging.info("Planilha 'Filtro' criada.")
 
-            # Encontra a última linha preenchida na coluna 'T'
-            last_row = sheet.range('T' + str(sheet.cells.last_cell.row)).end('up').row
-            # Move valores na coluna 'T' para cima (até 4 linhas acima)
-            for row in range(2, last_row + 1):
-                cell_value = sheet.range(f'T{row}').value
-                if cell_value:
-                    move_to_row = max(2, row - 4)
-                    sheet.range(f'T{move_to_row}').value = cell_value
-                    sheet.range(f'T{row}').value = ''
-
-            # Chama função para preencher as células da coluna 'S' com valores da coluna 'T'
-            preencher_celulas_st(sheet)
-
-        # Cria tabela dinâmica com os dados processados
-        criar_tabela_dinamica(wb)
-        # Salva e fecha o arquivo
+        for sheet in wb.sheets:
+            if sheet.name != 'Filtro':
+                logging.info(f"Processando planilha: {sheet.name}")
+                desmesclar_e_mover(sheet)
+                sheet.range('S2:S100').formula = '=IF(LEFT(A2, 4) = "Nota", B2, "")'
+                sheet.range('T2:T100').formula = '=IF(ISERROR(SEARCH(" - ", A1)), "", IF(AND(ISNUMBER(VALUE(LEFT(A1, SEARCH(" - ", A1) - 1))), SEARCH(" - ", A1) > 0), A1, ""))'
+                sheet.range('U2:U100').formula = '=IF(LEFT(E2, 10) = "Fornecedor", H2, "")'
+                preencher_celulas_st(sheet)
+        
+        consolidar_dados(wb, sheet_consolidado)
+        apagar_stu(wb)
+        apagar_planilhas(wb)
         wb.save()
         wb.close()
-        resultado_label.config(text="Processamento concluído com sucesso!")
+        
+        logging.info("Processamento concluído e arquivo salvo.")
+        
+        messagebox.showinfo("Concluído", "O processamento foi concluído com sucesso!")
+        
     except Exception as e:
-        # Exibe mensagem de erro em caso de falha
-        resultado_label.config(text=f"Erro: {str(e)}")
+        logging.error(f"Erro durante o processamento: {str(e)}")
+    finally:
+        app.screen_updating = True
+        app.calculation = 'automatic'
+        app.quit()
+        logging.info("Configurações do Excel restauradas e aplicativo fechado.")
+
+def desmesclar_e_mover(sheet):
+    logging.info(f"Desmesclando células na planilha {sheet.name}")
+    ultima_linha = sheet.cells(sheet.cells.last_cell.row, 1).end('up').row
+    for i in range(2, ultima_linha + 1):
+        for col in 'ABCDEFGHIJKLMNO':
+            cell = sheet.range(f'{col}{i}')
+            if cell.merge_cells:
+                cell.unmerge()
+                logging.info(f"Célula {col}{i} desmesclada.")
+        if sheet.range(f'D{i}').value == "Fornecedor":
+            for col in reversed(range(4, 11)):
+                origem = sheet.cells(i, col)
+                destino = sheet.cells(i, col + 1)
+                destino.value = origem.value
+                origem.clear_contents()
 
 def preencher_celulas_st(sheet):
-    """
-    Preenche as células vazias na coluna 'S' com o último valor
-    preenchido da mesma coluna, se houver um valor correspondente
-    na coluna 'T'.
-    """
+    logging.info("Preenchendo células ST na planilha.")
     ultima_linha = sheet.range('S' + str(sheet.cells.last_cell.row)).end('up').row
+    nota_atual = fornecedor_atual = None
+    for i in range(2, ultima_linha + 1):
+        if sheet.range(f'S{i}').value:
+            nota_atual = sheet.range(f'S{i}').value
+        if sheet.range(f'U{i}').value:
+            fornecedor_atual = sheet.range(f'U{i}').value
+        if sheet.range(f'T{i}').value:
+            sheet.range(f'S{i}').value = nota_atual
+            sheet.range(f'U{i}').value = fornecedor_atual
+            
+def aplicar_filtro(sheet):
+    logging.info("Aplicando filtro nas colunas A a I.")
+    sheet.range("A:C").api.AutoFilter(1)  
+
+
+def consolidar_dados(wb, sheet_consolidado):
+    logging.info("Consolidando dados na planilha 'Filtro'.")
+    sheet_consolidado.range('A1').value = ['Nota', 'Fornecedor', 'Insumo']
+    dados_consolidados = []
+    for sheet in wb.sheets:
+        if sheet.name != 'Filtro':
+            ultima_linha = sheet.range('S' + str(sheet.cells.last_cell.row)).end('up').row
+            notas = sheet.range(f'S2:S{ultima_linha}').value
+            insumos = sheet.range(f'T2:T{ultima_linha}').value
+            fornecedores = sheet.range(f'U2:U{ultima_linha}').value
+            for nota, insumo, fornecedor in zip(notas, insumos, fornecedores):
+                if nota and insumo:
+                    dados_consolidados.append([nota, fornecedor, insumo])
+    sheet_consolidado.range('A2').value = dados_consolidados
     
-    # Itera sobre as linhas para preencher a coluna 'S'
-    for i in range(1, ultima_linha + 1):
-        valor_atual = sheet.range(f'S{i}').value
-        valor_t = sheet.range(f'T{i}').value
-        
-        # Preenche células vazias em 'S' com o último valor conhecido
-        if valor_atual and valor_t:
-            j = i + 1
-            while j <= ultima_linha and sheet.range(f'T{j}').value:
-                if not sheet.range(f'S{j}').value:
-                    sheet.range(f'S{j}').value = valor_atual
-                j += 1
+    sheet_consolidado.range('A:A').column_width = 20  # Largura da coluna A
+    sheet_consolidado.range('B:B').column_width = 85  # Largura da coluna B
+    sheet_consolidado.range('C:C').column_width = 70  # Largura da coluna C
+    
+    aplicar_filtro(sheet_consolidado)
+    
+    logging.info("Dados consolidados na planilha 'Filtro'.")
 
-def criar_tabela_dinamica(wb):
-    """
-    Cria uma nova planilha e insere uma tabela dinâmica com
-    base nas colunas 'S' e 'T' processadas das demais planilhas.
-    """
-    # Cria uma nova planilha para a tabela dinâmica
-    sheet = wb.sheets.add(name='Tabela Dinâmica')
-    dados = []
-
-    # Coleta dados das colunas 'S' e 'T' de todas as planilhas
-    for sh in wb.sheets:
-        ultima_linha = sh.range('S' + str(sh.cells.last_cell.row)).end('up').row
-        for i in range(2, ultima_linha + 1):
-            s_value = sh.range(f'S{i}').value
-            t_value = sh.range(f'T{i}').value
-            if s_value is not None and t_value is not None:
-                dados.append([s_value, t_value])
-
-    # Preenche a planilha com os dados e cria a tabela dinâmica
-    if dados:
-        sheet.range('A1').value = ['Nota', 'Insumo']
-        sheet.range('A2').value = dados
-        
-        # Determina última linha preenchida
-        last_row = sheet.range('A' + str(sheet.cells.last_cell.row)).end('up').row
-        
-        # Cria tabela dinâmica na nova planilha
-        tabela_dinamica = sheet.api.PivotTableWizard(
-            SourceData=sheet.range(f'A1:B{last_row}').api,
-            TableDestination=sheet.range('D1').api,
-            Function=-4100
-        )
-
-        # Configurações de campos da tabela dinâmica
-        tabela_dinamica.PivotFields('Nota').Orientation = 1  # xlRowField
-        tabela_dinamica.PivotFields('Insumo').Orientation = 2  # xlDataField
-        tabela_dinamica.PivotFields('Nota').Orientation = 3  # xlPageField (Filtro)
-        tabela_dinamica.PivotFields('Insumo').Orientation = 4  # xlColumnField (Filtro)
-
-        # Atualiza a tabela dinâmica
-        tabela_dinamica.RefreshTable()
-
-# Criação da interface gráfica
-root = tk.Tk()
-root.title("Processador de Arquivo Excel")
-root.geometry("400x200")
-
-# Label para mostrar o resultado do processamento
-resultado_label = tk.Label(root, text="")
-resultado_label.pack(pady=20)
-
-# Função para abrir o diálogo de seleção de arquivo
+def apagar_stu(wb):
+    for sheet in wb.sheets:
+        if sheet.name != 'Filtro':
+            sheet.range('S:U').clear_contents()
+            logging.info(f"Colunas S, T e U apagadas na planilha {sheet.name}")
+            
+def apagar_planilhas(wb):
+    for sheet in wb.sheets:
+        if 'Planilha' in sheet.name:
+            logging.info(f"Deletando a planilha: {sheet.name}")
+            sheet.delete()
+    logging.info("Planilhas com prefixo removido.")
+    
 def selecionar_arquivo():
-    """
-    Abre uma janela para selecionar o arquivo Excel a ser processado.
-    """
     arquivo = filedialog.askopenfilename(title="Selecione um arquivo Excel", filetypes=[("Excel Files", "*.xlsx")])
     if arquivo:
-        processar_arquivo(arquivo)
+        progress_bar.start()
+        Thread(target=lambda: processar_arquivo(arquivo)).start()
+        root.after(100, check_processing)
+
+def check_processing():
+    if logging.getLogger().hasHandlers():
+        progress_bar.stop()
+
+# Configuração da Interface Gráfica
+root = tk.Tk()
+root.title("Processador de Arquivo Excel")
+root.geometry("700x500")
+
+# Configuração do Text widget para exibir o log
+log_text = tk.Text(root, wrap="word", state="disabled")
+log_text.pack(padx=10, pady=10, expand=True, fill="both")
+
+# Barra de progresso para indicar carregamento
+progress_bar = ttk.Progressbar(root, orient="horizontal", mode="indeterminate")
+progress_bar.pack(pady=10, fill="x")
 
 # Botão para selecionar o arquivo
 botao_selecionar = tk.Button(root, text="Selecionar arquivo .xlsx", command=selecionar_arquivo)
-botao_selecionar.pack(pady=20)
+botao_selecionar.pack(pady=10)
 
-# Executa a interface gráfica
+# Configuração do logger para enviar os logs ao Text widget
+setup_logger(log_text)
+
 root.mainloop()
